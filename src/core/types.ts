@@ -25,3 +25,17 @@ export type GuardResult = {
   ok: boolean;
   violations: GuardViolation[];
 };
+
+export type PlanResponse = {
+  summary: string;
+  targetPaths: string[];
+  targetUrlPath: string;
+  openQuestions: string[];
+  risks: string[];
+  confidence: number;
+};
+
+export type PatchResponse = {
+  summary?: string;
+  edits: FileEdit[];
+};

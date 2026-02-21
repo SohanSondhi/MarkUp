@@ -1,0 +1,11 @@
+flowchart LR
+  SlackUser[Slack User] --> SlackBot[Markup Bot]
+  SlackBot --> Planner[Duo Agent Planner]
+  Planner --> Approval[Approve or Revise]
+  Approval --> Patcher[Duo Agent Patcher]
+  Patcher --> Guardrails[Frontend Guardrails]
+  Guardrails --> GitLabMR[GitLab MR]
+  GitLabMR --> Preview[Preview Deployment]
+  Preview --> SlackBot
+  Preview -. Planned .-> VisualQA[Duo Vision QA]
+  VisualQA -. Planned .-> SlackBot
