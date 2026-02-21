@@ -29,11 +29,7 @@ __pycache__/
 *.pyd
 .venv/
 venv/
-<<<<<<< HEAD
-=======
 agent/venv/
-venv/
->>>>>>> 5a6c879 (changed from gemini to gitlabs duo)
 env/
 ENV/
 

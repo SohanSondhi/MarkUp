@@ -1,65 +1,120 @@
-# Markup
+﻿# Markup
 
-## Project
+## What it does
 
-Markup lets non-technical teams request frontend changes in Slack and get a live preview before anything is merged. A marketing user describes a UI change in plain English, and Markup safely translates that intent into a frontend-only GitHub pull request. Each change is scoped, reviewable, and deployed to a preview environment so stakeholders can see the result before approving it. Markup enforces strict guardrails to avoid backend logic, configuration changes, or large refactors. The goal is not speed at all costs, but trust: clear intent, small diffs, and visual confirmation before code ships.
+Markup lets non-technical teams request frontend UI changes via Slack and get a live preview before anything is merged.
+
+```
+Slack message
+  -> TypeScript ingestion (src/)
+  -> GitLab Duo Planner  -- identifies which files to change
+  -> Python Agent        -- Gemini reads the Duo plan, generates patches
+  -> GitLab API          -- creates branch + commits + Draft MR
+  -> Vercel              -- deploys preview URL
+  -> Playwright          -- captures before/after screenshots
+  -> Slack               -- user approves or requests changes
+  -> GitLab MR           -- published for human review
+```
+
+---
 
 ## Project Structure
+
 ```
 markup/
-├── README.md
-├── package.json
-├── tsconfig.json
-├── .env.example
-│
-├── src/ # TypeScript orchestration layer
-│ ├── index.ts
-│ ├── config.ts
-│ 
-│ ├── sql/
-│ │ └── 001_init.sql                 # runs table
-│ 
-│ ├── db/
-│ │ ├── client.ts                    # Postgres connection
-│ │ └── runs.ts                      # run persistence helpers
-│ 
-│ ├── slack/
-│ │ ├── app.ts
-│ │ ├── handlers.ts
-│ │ ├── responses.ts
-│ │ └── updates.ts                   # threaded progress updates
-│ 
-│ ├── core/
-│ │ ├── orchestrator.ts              # now becomes a loop using RunStep
-│ │ ├── guards.ts
-│ │ ├── types.ts
-│ │ └── state.ts                     # RunStep enum + RunContext
-│ 
-│ ├── github/
-│ │ ├── client.ts
-│ │ ├── repo.ts
-│ │ ├── patch.ts
-│ │ ├── pr.ts
-│ │ └── checks.ts                    # CI status + failure summary
-│ 
-│ └── utils/
-│   ├── diff.ts
-│   └── logger.ts
-│
-├── agent/ # Python Gemini reasoning layer
-│ ├── main.py # Agent entrypoint
-│ ├── gemini.py # Gemini API wrapper
-│ ├── prompts.py # System and task prompts
-│ ├── schemas.py # Strict JSON output schemas
-│ ├── intent.py # Marketing intent classification
-│ ├── planner.py # Page selection and change planning
-│ ├── patcher.py # Frontend-only diff generation
-│ └── validators.py # Constraint enforcement
-│
-├── scripts/
-│ └── dev.ts # Local development runner
-│
-└── .github/
-└── workflows/
-└── preview.yml # CI build and preview deployment
++-- src/                          # TypeScript -- Slack bot & GitLab orchestration
+|   +-- index.ts                  # entry point
+|   +-- config.ts
+|   +-- slack/
+|   |   +-- app.ts
+|   |   +-- handlers.ts           # Slack event handlers
+|   |   +-- responses.ts
+|   |   +-- updates.ts            # threaded progress messages
+|   +-- core/
+|   |   +-- orchestrator.ts
+|   |   +-- guards.ts             # frontend-only path enforcement
+|   |   +-- types.ts
+|   |   +-- state.ts
+|   |   +-- runStore.ts
+|   +-- github/                   # (migrating to GitLab API)
+|   |   +-- agent.ts              # calls Python agent via HTTP
+|   |   +-- client.ts
+|   |   +-- repo.ts
+|   |   +-- patch.ts
+|   |   +-- pr.ts
+|   |   +-- checks.ts
+|   +-- utils/
+|       +-- diff.ts
+|       +-- logger.ts
+|
++-- agent/                        # Python -- Gemini AI brain
+|   +-- main.py                   # FastAPI app  ->  POST /ingest
+|   +-- schemas.py                # Pydantic types (request + response)
+|   +-- ingestion.py              # parses GitLab Duo plan, fetches lean snippets
+|   +-- planner.py                # Gemini call 1: structured patch plan
+|   +-- patcher.py                # Gemini call 2: actual file edits (1 per file)
+|   +-- validator.py              # frontend-only guardrails
+|   +-- gemini.py                 # Gemini client + key rotation
+|   +-- requirements.txt
+|
++-- hackathon/
+|   +-- MVP_ARCHITECTURE.md
+|   +-- architecture.mmd
+|   +-- gemini_integration.md
+|
++-- .env.example
++-- .gitignore
++-- package.json
++-- tsconfig.json
 ```
+
+---
+
+## Setup
+
+### TypeScript layer
+```bash
+npm install
+cp .env.example .env
+npm run dev
+```
+
+### Python agent
+```bash
+cd agent
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn agent.main:app --reload --port 8000
+```
+
+---
+
+## How Gemini + GitLab Duo work together
+
+| Step | Who | What |
+|------|-----|------|
+| 1 | GitLab Duo Planner | Reads the repo, identifies files to touch, creates a structured issue |
+| 2 | ingestion.py | Filters to frontend files only, extracts lean snippets |
+| 3 | planner.py + Gemini | Reads the Duo plan, decides what to change per file |
+| 4 | patcher.py + Gemini | Generates patched file content (one call per file) |
+| 5 | validator.py | Blocks any non-frontend or dangerous code |
+| 6 | TypeScript + GitLab API | Commits patches, opens Draft MR, triggers Vercel preview |
+
+Duo handles code understanding. Gemini handles code generation. Each Gemini call gets a short, targeted prompt -- never the full repo.
+
+---
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `SLACK_BOT_TOKEN` | Slack bot OAuth token |
+| `SLACK_SIGNING_SECRET` | Slack signing secret |
+| `GITLAB_TOKEN` | GitLab personal access token |
+| `GITLAB_PROJECT_ID` | GitLab project ID |
+| `GEMINI_API_KEY` | Gemini API key |
+| `GEMINI_API_KEY_2` / `_3` | Optional rotation keys for rate limits |
+| `GEMINI_MODEL` | Model name (default: `gemini-1.5-flash`) |
+| `AGENT_BASE_URL` | Python agent URL (default: `http://localhost:8000`) |
+| `VERCEL_TOKEN` | Vercel API token |
