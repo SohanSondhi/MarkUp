@@ -1,20 +1,92 @@
 import type { Octokit } from "@octokit/rest";
+import * as path from "node:path";
 import { createPrSimple, type FileEdit } from "./pr.js";
 import { listRepoFiles, getFileContent, getDefaultBranch, searchRepoFiles } from "./repo.js";
 import { waitForPreviewUrl } from "./checks.js";
 import { assertFrontendEdits } from "../core/orchestrator.js";
+import type { PlanResponse, PatchResponse } from "../core/types.js";
 
-type AgentEdits = {
-  summary?: string;
-  edits: FileEdit[];
+/* ────────────────────────────────────────────────────────────
+ * GitLab Duo agent HTTP client
+ *
+ * The Duo agent runs as an external service and exposes two
+ * endpoints that replace the previous Gemini-based planner and
+ * patcher modules:
+ *
+ *   POST /plan  — accepts a request + file context, returns a plan
+ *   POST /patch — accepts a request + plan + file contents, returns edits
+ * ──────────────────────────────────────────────────────────── */
+
+const DUO_AGENT_URL = process.env.DUO_AGENT_URL ?? "http://localhost:8200";
+const DUO_AGENT_TIMEOUT_MS = 120_000;
+
+type DuoPlanRequest = {
+  request: string;
+  frontendRoot: string;
+  availableFiles: string[];
+  fileContents: { path: string; content: string }[];
 };
 
-const DEFAULT_MODEL = "gemini-3-flash-preview";
-const MAX_FILES_FOR_CONTEXT = 6;
-const RETRY_MAX_FILES_FOR_CONTEXT = 12;
-const MAX_FILE_CONTENT_CHARS = 20000;
-const MAX_LISTED_FILES = 40;
+type DuoPatchRequest = {
+  request: string;
+  frontendRoot: string;
+  availableFiles: string[];
+  fileContents: { path: string; content: string }[];
+  plan: PlanResponse;
+  forceEdit: boolean;
+};
+
+async function callDuoAgent<TReq, TRes>(endpoint: string, body: TReq): Promise<TRes> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DUO_AGENT_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${DUO_AGENT_URL}${endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Duo agent ${endpoint} failed (${response.status}): ${errorText}`);
+    }
+
+    return (await response.json()) as TRes;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function duoPlan(args: DuoPlanRequest): Promise<PlanResponse> {
+  return callDuoAgent<DuoPlanRequest, PlanResponse>("/plan", args);
+}
+
+async function duoPatch(args: DuoPatchRequest): Promise<PatchResponse> {
+  return callDuoAgent<DuoPatchRequest, PatchResponse>("/patch", args);
+}
+
+function normalizeEdits(edits: PatchResponse["edits"]): FileEdit[] {
+  return edits
+    .map((edit) => ({
+      path: String(edit.path ?? "")
+        .trim()
+        .replace(/\\/g, "/")
+        .replace(/^\/+/, ""),
+      content: String(edit.content ?? ""),
+    }))
+    .filter((edit) => edit.path.length > 0);
+}
+
+const MAX_PLAN_CONTEXT_FILES = 4;
+const MAX_PLAN_BATCHES = 3;
+const MAX_PATCH_CONTEXT_FILES = 8;
+const RETRY_MAX_PATCH_CONTEXT_FILES = 10;
+const MAX_FILE_CONTENT_CHARS = 10000;
 const MAX_SEARCH_TOKENS = 4;
+const SOURCE_EXTENSIONS = [".tsx", ".ts", ".jsx", ".js"];
+const INDEX_FILES = SOURCE_EXTENSIONS.map((ext) => `index${ext}`);
 
 const STOPWORDS = new Set([
   "add",
@@ -49,11 +121,6 @@ const STOPWORDS = new Set([
 
 function normalizePrefix(raw: string): string {
   return raw.trim().replace(/^\/+/, "").replace(/\/+$/, "");
-}
-
-function normalizeModel(raw: string): string {
-  const trimmed = raw.trim();
-  return trimmed.startsWith("models/") ? trimmed.slice("models/".length) : trimmed;
 }
 
 function getFrontendRoot(): string {
@@ -118,6 +185,163 @@ function dedupePaths(paths: string[]): string[] {
   return result;
 }
 
+function buildPathLookup(allPaths: string[]): Map<string, string> {
+  const lookup = new Map<string, string>();
+  for (const path of allPaths) {
+    lookup.set(path.toLowerCase(), path);
+  }
+  return lookup;
+}
+
+function lookupPath(lookup: Map<string, string>, candidate: string): string | null {
+  return lookup.get(candidate.toLowerCase()) ?? null;
+}
+
+function resolveWithExtensions(lookup: Map<string, string>, basePath: string): string | null {
+  const direct = lookupPath(lookup, basePath);
+  if (direct) return direct;
+
+  for (const ext of SOURCE_EXTENSIONS) {
+    const withExt = `${basePath}${ext}`;
+    const found = lookupPath(lookup, withExt);
+    if (found) return found;
+  }
+
+  for (const indexFile of INDEX_FILES) {
+    const withIndex = path.posix.join(basePath, indexFile);
+    const found = lookupPath(lookup, withIndex);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function resolveImportPath(args: {
+  importPath: string;
+  fromPath: string;
+  allPaths: string[];
+  frontendRoot: string;
+  lookup: Map<string, string>;
+}): string | null {
+  const { importPath, fromPath, allPaths, frontendRoot, lookup } = args;
+  const cleaned = importPath.trim();
+  if (!cleaned) return null;
+
+  if (cleaned.startsWith(".")) {
+    const baseDir = fromPath.split("/").slice(0, -1).join("/");
+    const resolved = path.posix.normalize(path.posix.join(baseDir, cleaned));
+    return resolveWithExtensions(lookup, resolved);
+  }
+
+  let normalized = cleaned;
+  if (normalized.startsWith("@/") || normalized.startsWith("~/")) {
+    normalized = normalized.slice(2);
+  }
+  if (normalized.startsWith("/")) {
+    normalized = normalized.slice(1);
+  }
+
+  const rootCandidate = path.posix.join(frontendRoot, normalized);
+  const resolvedFromRoot = resolveWithExtensions(lookup, rootCandidate);
+  if (resolvedFromRoot) return resolvedFromRoot;
+
+  const suffixes: string[] = [];
+  for (const ext of SOURCE_EXTENSIONS) {
+    suffixes.push(`${normalized}${ext}`);
+  }
+  for (const indexFile of INDEX_FILES) {
+    suffixes.push(path.posix.join(normalized, indexFile));
+  }
+
+  for (const candidate of allPaths) {
+    const lower = candidate.toLowerCase();
+    if (suffixes.some((suffix) => lower.endsWith(suffix.toLowerCase()))) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function extractImportPaths(content: string): string[] {
+  const results = new Set<string>();
+  const patterns = [
+    /import\s+[^'"]*?\sfrom\s+['"]([^'"]+)['"]/g,
+    /import\s+['"]([^'"]+)['"]/g,
+    /require\(\s*['"]([^'"]+)['"]\s*\)/g,
+    /import\(\s*['"]([^'"]+)['"]\s*\)/g,
+  ];
+
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      if (match[1]) results.add(match[1]);
+    }
+  }
+
+  return Array.from(results);
+}
+
+function findRelatedPaths(args: {
+  fileContents: { path: string; content: string }[];
+  allPaths: string[];
+  frontendRoot: string;
+}): string[] {
+  const { fileContents, allPaths, frontendRoot } = args;
+  const lookup = buildPathLookup(allPaths);
+  const related = new Set<string>();
+
+  for (const file of fileContents) {
+    const importPaths = extractImportPaths(file.content);
+    for (const importPath of importPaths) {
+      const resolved = resolveImportPath({
+        importPath,
+        fromPath: file.path,
+        allPaths,
+        frontendRoot,
+        lookup,
+      });
+      if (resolved) related.add(resolved);
+    }
+  }
+
+  return Array.from(related);
+}
+
+function findPathsByNameTokens(allPaths: string[], request: string): string[] {
+  const rawTokens = filterSearchTokens(tokenizeRequest(request));
+  if (rawTokens.length === 0) return [];
+
+  const tokens = new Set(rawTokens);
+  const addSynonyms = (entries: string[]) => {
+    for (const entry of entries) tokens.add(entry);
+  };
+
+  if (tokens.has("navbar") || tokens.has("nav") || tokens.has("navigation")) {
+    addSynonyms(["header", "topbar", "appbar", "menu", "nav", "navbar", "navigation", "layout"]);
+  }
+  if (tokens.has("header")) {
+    addSynonyms(["navbar", "nav", "topbar", "layout"]);
+  }
+  if (tokens.has("menu")) {
+    addSynonyms(["nav", "navbar", "navigation"]);
+  }
+  if (tokens.has("footer")) {
+    addSynonyms(["bottom", "sitefooter"]);
+  }
+
+  const matchTokens = Array.from(tokens);
+  const matches: string[] = [];
+  for (const path of allPaths) {
+    const base = path.split("/").pop()?.toLowerCase() ?? "";
+    const name = base.replace(/\.[^.]+$/, "");
+    if (matchTokens.some((token) => name.includes(token))) {
+      matches.push(path);
+    }
+  }
+  return matches;
+}
+
 function pickCandidateFiles(allPaths: string[], request: string): string[] {
   const tokens = tokenizeRequest(request);
   const scored = allPaths.map((path) => ({
@@ -128,123 +352,17 @@ function pickCandidateFiles(allPaths: string[], request: string): string[] {
   const withScore = scored.filter((item) => item.score > 0);
   withScore.sort((a, b) => b.score - a.score);
 
-  let picks = withScore.slice(0, MAX_FILES_FOR_CONTEXT).map((item) => item.path);
+  let picks = withScore.slice(0, MAX_PLAN_CONTEXT_FILES).map((item) => item.path);
   if (picks.length > 0) return picks;
 
   const fallbackKeywords = ["product", "pricing", "home", "index", "app", "page", "route"];
   const fallback = allPaths.filter((path) =>
     fallbackKeywords.some((keyword) => path.toLowerCase().includes(keyword))
   );
-  picks = fallback.slice(0, MAX_FILES_FOR_CONTEXT);
+  picks = fallback.slice(0, MAX_PLAN_CONTEXT_FILES);
   if (picks.length > 0) return picks;
 
-  return allPaths.slice(0, MAX_FILES_FOR_CONTEXT);
-}
-
-function formatFileList(paths: string[]): string {
-  return paths.slice(0, MAX_LISTED_FILES).map((path) => `- ${path}`).join("\n");
-}
-
-function formatFileContents(files: { path: string; content: string }[]): string {
-  return files
-    .map((file) => `--- path: ${file.path}\n${file.content}\n--- end`)
-    .join("\n\n");
-}
-
-function buildPrompt(args: {
-  request: string;
-  frontendRoot: string;
-  availableFiles: string[];
-  fileContents: { path: string; content: string }[];
-  forceEdit: boolean;
-}): string {
-  const { request, frontendRoot, availableFiles, fileContents, forceEdit } = args;
-  return [
-    "You are a coding agent for a frontend-only repo.",
-    `Only edit files under "${frontendRoot}/".`,
-    "Prefer reusing existing components; do not invent new ones unless necessary.",
-    "Only edit files whose full contents are provided below.",
-    "Return strict JSON only (no markdown).",
-    "JSON shape:",
-    '{"summary":"short summary","edits":[{"path":"frontend/...","content":"FULL FILE CONTENT"}]}',
-    "",
-    `REQUEST:\n${request}`,
-    "",
-    "AVAILABLE FILES (subset):",
-    formatFileList(availableFiles),
-    "",
-    "FILE CONTENTS:",
-    formatFileContents(fileContents),
-    "",
-    forceEdit
-      ? "You must return at least one edit. If uncertain, choose the best matching page and add a minimal, sensible change."
-      : "If no change is possible, return {\"summary\":\"No safe change\",\"edits\":[]}.",
-  ].join("\n");
-}
-
-function extractJson(text: string): AgentEdits {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = fenced ? fenced[1] : text;
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("Gemini response did not contain JSON.");
-  }
-
-  const jsonText = raw.slice(start, end + 1).trim();
-  const parsed = JSON.parse(jsonText) as AgentEdits;
-
-  if (!parsed || !Array.isArray(parsed.edits)) {
-    throw new Error("Gemini response JSON is missing the edits array.");
-  }
-
-  return parsed;
-}
-
-async function callGemini(prompt: string): Promise<AgentEdits> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("Missing GEMINI_API_KEY");
-
-  const model = normalizeModel(process.env.GEMINI_MODEL ?? DEFAULT_MODEL);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-  const fetchFn = globalThis.fetch;
-  if (!fetchFn) {
-    throw new Error("Global fetch is not available in this runtime.");
-  }
-
-  const response = await fetchFn(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Gemini request failed (${response.status}): ${errorText}`);
-  }
-
-  const payload = await response.json();
-  const text = payload?.candidates?.[0]?.content?.parts
-    ?.map((part: { text?: string }) => part.text ?? "")
-    .join("") ?? "";
-
-  if (!text) throw new Error("Gemini response was empty.");
-  return extractJson(text);
-}
-
-function normalizeEdits(edits: AgentEdits["edits"]): FileEdit[] {
-  return edits
-    .map((edit) => ({
-      path: String(edit.path ?? "")
-        .trim()
-        .replace(/\\/g, "/")
-        .replace(/^\/+/, ""),
-      content: String(edit.content ?? ""),
-    }))
-    .filter((edit) => edit.path.length > 0);
+  return allPaths.slice(0, MAX_PLAN_CONTEXT_FILES);
 }
 
 async function collectFileContents(args: {
@@ -297,23 +415,31 @@ async function findCandidatePaths(args: {
   return dedupePaths([...searchHits, ...entryFiles, ...pathScored]);
 }
 
-export async function createPrFromAgent(args: {
+function ensureNoNewFiles(edits: FileEdit[], allPaths: string[]): void {
+  const existingPaths = new Set(allPaths.map((path) => path.toLowerCase()));
+  const newFiles = edits.filter((edit) => !existingPaths.has(edit.path.toLowerCase()));
+  if (newFiles.length > 0) {
+    const paths = newFiles.map((edit) => edit.path).join(", ");
+    throw new Error(`Agent attempted to create new files (not allowed): ${paths}`);
+  }
+}
+
+function buildPrBody(request: string, summary?: string): string {
+  return [
+    "Automated PR generated from a Slack request.",
+    "",
+    `Request: ${request}`,
+    summary ? `\nAgent summary: ${summary}` : "",
+  ].join("\n");
+}
+
+export async function createPlanForRequest(args: {
   octokit: Octokit;
   owner: string;
   repo: string;
   request: string;
-  branchName: string;
-  title: string;
-  body?: string;
-}): Promise<{
-  prUrl: string;
-  prNumber: number;
-  baseBranch: string;
-  previewUrl: string | null;
-  summary?: string;
-  edits: FileEdit[];
-}> {
-  const { octokit, owner, repo, request, branchName, title, body } = args;
+}): Promise<PlanResponse> {
+  const { octokit, owner, repo, request } = args;
   const frontendRoot = getFrontendRoot();
 
   const baseBranch = await getDefaultBranch({ octokit, owner, repo });
@@ -335,29 +461,123 @@ export async function createPrFromAgent(args: {
     request,
   });
 
-  const fileContents = await collectFileContents({
+  const nameMatches = findPathsByNameTokens(allPaths, request);
+  const prioritized = dedupePaths([...nameMatches, ...candidates]);
+  const planCandidateLimit = MAX_PLAN_CONTEXT_FILES * MAX_PLAN_BATCHES;
+  const planCandidates = prioritized.slice(0, planCandidateLimit);
+
+  const planContents = await collectFileContents({
     octokit,
     owner,
     repo,
     ref: baseBranch,
-    paths: candidates,
-    maxFiles: MAX_FILES_FOR_CONTEXT,
+    paths: planCandidates,
+    maxFiles: planCandidateLimit,
   });
 
-  if (fileContents.length === 0) {
-    throw new Error("No suitable frontend files found to provide to the agent.");
+  if (planContents.length === 0) {
+    throw new Error("No suitable frontend files found to provide to the planner.");
   }
 
-  const prompt = buildPrompt({
+  // Delegate planning to the GitLab Duo agent instead of Gemini
+  const plan = await duoPlan({
+    request,
+    frontendRoot,
+    availableFiles: allPaths,
+    fileContents: planContents,
+  });
+
+  return plan;
+}
+
+export async function runApprovedPlan(args: {
+  octokit: Octokit;
+  owner: string;
+  repo: string;
+  request: string;
+  plan: PlanResponse;
+  branchName: string;
+  title: string;
+  body?: string;
+}): Promise<{
+  prUrl: string;
+  prNumber: number;
+  baseBranch: string;
+  previewUrl: string | null;
+  summary?: string;
+  edits: FileEdit[];
+}> {
+  const { octokit, owner, repo, request, plan, branchName, title, body } = args;
+  const frontendRoot = getFrontendRoot();
+
+  const baseBranch = await getDefaultBranch({ octokit, owner, repo });
+  const repoFiles = await listRepoFiles({
+    octokit,
+    owner,
+    repo,
+    ref: baseBranch,
+    prefix: frontendRoot,
+  });
+
+  const allPaths = repoFiles.map((file) => file.path);
+  const candidates = await findCandidatePaths({
+    octokit,
+    owner,
+    repo,
+    frontendRoot,
+    allPaths,
+    request,
+  });
+
+  const nameMatches = findPathsByNameTokens(allPaths, request);
+  const prioritized = plan.targetPaths?.length
+    ? dedupePaths([...plan.targetPaths, ...nameMatches, ...candidates])
+    : dedupePaths([...nameMatches, ...candidates]);
+
+  const baseContents = await collectFileContents({
+    octokit,
+    owner,
+    repo,
+    ref: baseBranch,
+    paths: prioritized,
+    maxFiles: MAX_PATCH_CONTEXT_FILES,
+  });
+
+  if (baseContents.length === 0) {
+    throw new Error("No suitable frontend files found to provide to the patcher.");
+  }
+
+  const relatedPaths = findRelatedPaths({
+    fileContents: baseContents,
+    allPaths,
+    frontendRoot,
+  });
+
+  const expandedPaths = relatedPaths.length > 0
+    ? dedupePaths([...prioritized, ...relatedPaths])
+    : prioritized;
+
+  const fileContents = expandedPaths.length === prioritized.length
+    ? baseContents
+    : await collectFileContents({
+        octokit,
+        owner,
+        repo,
+        ref: baseBranch,
+        paths: expandedPaths,
+        maxFiles: MAX_PATCH_CONTEXT_FILES,
+      });
+
+  let patchResponse: PatchResponse = await duoPatch({
     request,
     frontendRoot,
     availableFiles: allPaths,
     fileContents,
+    plan,
     forceEdit: false,
   });
 
-  let agentResponse = await callGemini(prompt);
-  let normalizedEdits = normalizeEdits(agentResponse.edits);
+  let normalizedEdits = normalizeEdits(patchResponse.edits);
 
   if (normalizedEdits.length === 0) {
     const retryContents = await collectFileContents({
@@ -365,45 +585,31 @@ export async function createPrFromAgent(args: {
       owner,
       repo,
       ref: baseBranch,
-      paths: candidates,
-      maxFiles: RETRY_MAX_FILES_FOR_CONTEXT,
+      paths: expandedPaths,
+      maxFiles: RETRY_MAX_PATCH_CONTEXT_FILES,
     });
 
-    const retryPrompt = buildPrompt({
+    patchResponse = await duoPatch({
       request,
       frontendRoot,
       availableFiles: allPaths,
       fileContents: retryContents,
+      plan,
       forceEdit: true,
     });
-
-    agentResponse = await callGemini(retryPrompt);
-    normalizedEdits = normalizeEdits(agentResponse.edits);
+    normalizedEdits = normalizeEdits(patchResponse.edits);
   }
 
   if (normalizedEdits.length === 0) {
     throw new Error(
-      "Gemini did not return any edits. Try adding the target page or component name to the request."
+      "Duo agent did not return any edits. Try adding the target page or component name to the request."
     );
   }
 
-  const existingPaths = new Set(allPaths.map((path) => path.toLowerCase()));
-  const newFiles = normalizedEdits.filter((edit) => !existingPaths.has(edit.path.toLowerCase()));
-  if (newFiles.length > 0) {
-    const paths = newFiles.map((edit) => edit.path).join(", ");
-    throw new Error(`Agent attempted to create new files (not allowed): ${paths}`);
-  }
-
+  ensureNoNewFiles(normalizedEdits, allPaths);
   assertFrontendEdits(normalizedEdits);
 
-  const prBody =
-    body ??
-    [
-      "Automated PR generated from a Slack request.",
-      "",
-      `Request: ${request}`,
-      agentResponse.summary ? `\nAgent summary: ${agentResponse.summary}` : "",
-    ].join("\n");
+  const prBody = body ?? buildPrBody(request, patchResponse.summary);
 
   const { prUrl, prNumber, baseBranch: prBaseBranch } = await createPrSimple({
     octokit,
@@ -427,7 +633,45 @@ export async function createPrFromAgent(args: {
     prNumber,
     baseBranch: prBaseBranch,
     previewUrl,
-    summary: agentResponse.summary,
+    summary: patchResponse.summary,
     edits: normalizedEdits,
   };
+}
+
+export async function createPrFromAgent(args: {
+  octokit: Octokit;
+  owner: string;
+  repo: string;
+  request: string;
+  branchName: string;
+  title: string;
+  body?: string;
+}): Promise<{
+  prUrl: string;
+  prNumber: number;
+  baseBranch: string;
+  previewUrl: string | null;
+  summary?: string;
+  edits: FileEdit[];
+  plan: PlanResponse;
+}> {
+  const plan = await createPlanForRequest({
+    octokit: args.octokit,
+    owner: args.owner,
+    repo: args.repo,
+    request: args.request,
+  });
+
+  const result = await runApprovedPlan({
+    octokit: args.octokit,
+    owner: args.owner,
+    repo: args.repo,
+    request: args.request,
+    plan,
+    branchName: args.branchName,
+    title: args.title,
+    body: args.body,
+  });
+
+  return { ...result, plan };
 }
